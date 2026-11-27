@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>可重分片数据迭代器：4 Worker → 2 Worker 恢复对比</title>
+    <meta
+      name="description"
+      content="对比同一小模型不中断的四 worker 训练与缩组为两 worker 后的恢复训练，逐步检查全局样本顺序、梯度更新和最终权重。"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <p class="eyebrow">Reshardable Iterator · Deterministic Recovery</p>
+        <h1>4 个模拟 worker 缩到 2 个：全局顺序与梯度更新逐步一致</h1>
+        <p class="lede">
+          检查点只保存<strong>已提交全局批次边界</strong>上的扁平样本游标和模型权重。
+          若崩溃时上一全局步只有部分 worker 完成，则丢弃尚未提交的半批梯度，
+          回到该批起点，并用新的 2-worker 分片重放完整全局批次。
+        </p>
+      </header>
+
+      <section class="panel controls" aria-label="对比参数">
+        <div class="control">
+          <label for="fail-step">中断的全局步（从 0 开始）</label>
+          <select id="fail-step" data-testid="fail-step">
+            <option value="2">第 3 步</option>
+            <option value="3" selected>第 4 步（默认）</option>
+            <option value="5">第 6 步</option>
+            <option value="7">第 8 步</option>
+            <option value="11">第 12 步</option>
+          </select>
+        </div>
+        <div class="control">
+          <label for="partial-workers">崩溃前完成的 4-worker 分片</label>
+          <select id="partial-workers" data-testid="partial-workers">
+            <option value="1">1 / 4（四分之一）</option>
+            <option value="2" selected>2 / 4（正好一半）</option>
+            <option value="3">3 / 4（四分之三）</option>
+          </select>
+        </div>
+        <button class="primary" id="run-comparison" type="button" data-testid="run-button">
+          重新运行浏览器对比
+        </button>
+        <p class="control-note">
+          所有训练计算都在本页 JavaScript 中完成；无后端、无随机网络请求。数据集、种子、学习率和初始权重固定。
+        </p>
+      </section>
+
+      <section
+        id="verdict-banner"
+        class="verdict"
+        role="status"
+        aria-live="polite"
+        data-testid="comparison-status"
+      ></section>
+
+      <section class="policy-grid" aria-label="恢复策略">
+        <article class="panel policy-card">
+          <h3><span class="policy-number">1</span>只检查点全局游标</h3>
+          <p>
+            不保存会随拓扑失效的各 rank 私有偏移。恢复时用同一个 epoch/seed 生成全局排列，
+            再按 <code>worldSize=2</code> 重新切分同一批样本。
+          </p>
+        </article>
+        <article class="panel policy-card">
+          <h3><span class="policy-number">2</span>半批回滚并重放</h3>
+          <p>
+            优化器全局步是原子的。已完成 worker 的局部梯度若未进入提交，就不能形成权重检查点；
+            恢复到该全局批起点，整批在 2 个 worker 上重算。
+          </p>
+        </article>
+        <article class="panel policy-card">
+          <h3><span class="policy-number">3</span>按全局顺序归约</h3>
+          <p>
+            worker 数改变分组方式，但梯度按 <code>sequencePosition</code>
+            规范排序后累加，因此本演示中连 IEEE-754 结果和最终权重都逐位相同。
+          </p>
+        </article>
+      </section>
+
+      <section class="kpi-grid" aria-label="一致性指标">
+        <div class="panel kpi">
+          <span class="kpi-label">全局更新步</span>
+          <strong class="kpi-value" id="kpi-steps">—</strong>
+          <span class="kpi-sub" id="kpi-steps-sub">两条训练轨迹</span>
+        </div>
+        <div class="panel kpi">
+          <span class="kpi-label">样本顺序</span>
+          <strong class="kpi-value good-text" id="kpi-samples" data-testid="sample-order-result">—</strong>
+          <span class="kpi-sub" id="kpi-samples-sub">逐步及扁平化顺序</span>
+        </div>
+        <div class="panel kpi">
+          <span class="kpi-label">最大梯度差</span>
+          <strong class="kpi-value mono" id="kpi-gradient" data-testid="gradient-result">—</strong>
+          <span class="kpi-sub">规范顺序归约</span>
+        </div>
+        <div class="panel kpi">
+          <span class="kpi-label">最大权重差</span>
+          <strong class="kpi-value mono" id="kpi-weights" data-testid="weights-result">—</strong>
+          <span class="kpi-sub" id="kpi-weights-sub">全部提交步</span>
+        </div>
+      </section>
+
+      <section class="two-col">
+        <article class="panel info-card">
+          <div class="section-heading" style="margin-top: 0">
+            <div>
+              <h2>最终权重</h2>
+              <p>线性模型 <code>ŷ = w₁x₁ + w₂x₂ + b</code>；两侧逐位一致。</p>
+            </div>
+            <span class="badge good" id="final-weights-badge" data-testid="final-weights-badge">—</span>
+          </div>
+          <div class="table-wrap">
+            <table data-testid="final-weights-table">
+              <thead>
+                <tr>
+                  <th>参数</th>
+                  <th class="num">不中断 / 4 worker</th>
+                  <th class="num">缩组恢复 / 2 worker</th>
+                  <th class="num">差值</th>
+                </tr>
+              </thead>
+              <tbody id="final-weights-body"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel info-card">
+          <h2>崩溃时的恢复决策</h2>
+          <p>
+            下面是最后一个已提交检查点，以及半批事件如何把观察游标
+            <code id="observed-cursor">—</code> 对齐回
+            <code id="resume-cursor">—</code>。
+          </p>
+          <div id="recovery-summary" style="margin: 12px 0"></div>
+          <pre class="checkpoint" id="checkpoint-json" data-testid="checkpoint-json"></pre>
+        </article>
+      </section>
+
+      <section class="panel info-card" style="margin: 16px 0">
+        <div class="section-heading" style="margin-top: 0">
+          <div>
+            <h2>事件轨迹</h2>
+            <p>明确区分“已完成的局部计算”和“已提交的全局梯度更新”。</p>
+          </div>
+        </div>
+        <ol class="event-log" id="event-log" data-testid="event-log"></ol>
+        <h3 style="margin: 18px 0 8px">完整扁平化全局样本顺序</h3>
+        <div class="order-strip" id="flattened-order" data-testid="flattened-order"></div>
+      </section>
+
+      <section>
+        <div class="section-heading">
+          <div>
+            <h2>逐步样本、分片与数值对比</h2>
+            <p>每个卡片中的样本芯片按全局顺序排列；worker 行只是对同一全局批次的不同切分。</p>
+          </div>
+          <div class="legend" aria-label="Worker 颜色">
+            <span class="badge"><span class="worker-badge">W0</span></span>
+            <span class="badge"><span class="worker-badge w1">W1</span></span>
+            <span class="badge"><span class="worker-badge w2">W2</span></span>
+            <span class="badge"><span class="worker-badge w3">W3</span></span>
+          </div>
+        </div>
+        <div class="step-list" id="step-list" data-testid="step-list"></div>
+      </section>
+
+      <footer>
+        核心逻辑位于 <code>src/reshard-iterator.js</code> 与 <code>src/training.js</code>；
+        运行 <code>npm test</code> 可执行 21 项确定性/恢复测试，运行 <code>npm start</code> 后访问本页。
+      </footer>
+    </main>
+
+    <script src="./web/app.classic.js" defer></script>
+  </body>
+</html>

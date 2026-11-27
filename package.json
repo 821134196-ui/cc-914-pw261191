@@ -1,0 +1,21 @@
+{
+  "name": "reshardable-training-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser comparison of uninterrupted four-worker training and two-worker recovery with a reshardable global sample iterator.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build:browser": "esbuild web/app.js --bundle --format=iife --target=es2020 --outfile=web/app.classic.js",
+    "start": "node server.js",
+    "dev": "node server.js",
+    "preview": "node server.js",
+    "check": "node --check src/reshard-iterator.js && node --check src/training.js && node --check web/app.js && node --check web/app.classic.js && node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
